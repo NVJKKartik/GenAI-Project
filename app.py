@@ -1,8 +1,13 @@
 import os, io, requests, time, json
+os.environ["SM_FRAMEWORK"] = "tf.keras"
 from typing import List
 import google.generativeai as genai
 import gradio as gr
 from PIL import Image
+import segmentation_models as sm
+import cv2
+import numpy as np
+import keras
 
 HUGGING_FACE_API_KEY=""
 GOOGLE_API_KEY = ""
@@ -48,18 +53,140 @@ llm_model_names = [
 #diffusion models
 diffusion_model_names = [
 	"stabilityai/stable-diffusion-xl-base-1.0",
-    "stablediffusionapi/toonyou",
-    "stablediffusionapi/real-cartoon-3d",
-    "stablediffusionapi/realcartoon3d",
-    "stablediffusionapi/disney-pixar-cartoon",
-    "stablediffusionapi/pastel-mix-stylized-anime",
-    "stablediffusionapi/anything-v5",    
-    "nitrosocke/Ghibli-Diffusion",
-    "jinaai/flat-2d-animerge",
-    "Lykon/DreamShaper", 
-    "SG161222/Realistic_Vision_V6.0_B1_noVAE",
-    "black-forest-labs/FLUX.1-dev"
+    "stabilityai/stable-diffusion-3.5-large",
+    "black-forest-labs/FLUX.1-dev",
+    "Jovie/Midjourney",
+    "XLabs-AI/flux-RealismLora",
+    "prithivMLmods/Canopus-LoRA-Flux-UltraRealism-2.0"
 ]
+
+# Download model
+os.system('wget https://huggingface.co/Armandoliv/cars-parts-segmentation-unet-resnet18/resolve/main/best_model.h5')
+os.system('pip -qq install pycocotools @ git+https://github.com/philferriere/cocoapi.git@2929bd2ef6b451054755dfd7ceb09278f935f7ad#subdirectory=PythonAPI')
+
+# Color definitions and classes
+c = ['_background_', 'back_bumper', 'back_glass', 'back_left_door', 'back_left_light', 'back_right_door', 
+    'back_right_light', 'front_bumper', 'front_glass', 'front_left_door', 'front_left_light', 
+    'front_right_door', 'front_right_light', 'hood', 'left_mirror', 'right_mirror', 'tailgate', 'trunk', 'wheel']
+colors = [(245,255,250), (75,0,130), (0,255,0), (32,178,170), (0,0,255), (0,255,255), (255,0,255), (128,0,128), (255,140,0),
+          (85,107,47), (102,205,170), (0,191,255), (255,0,0), (255,228,196), (205,133,63),
+          (220,20,60), (255,69,0), (143,188,143), (255,255,0)]
+
+# Initialize model
+sm.set_framework('tf.keras')
+sm.framework()
+BACKBONE = 'resnet18'
+n_classes = 19
+activation = 'softmax'
+model = sm.Unet(BACKBONE, classes=n_classes, activation=activation)
+model.load_weights('best_model.h5')
+
+def get_colored_segmentation_image(seg_arr, n_classes, colors=colors):
+    output_height = seg_arr.shape[0]
+    output_width = seg_arr.shape[1]
+
+    seg_img = np.zeros((output_height, output_width, 3))
+
+    for c in range(n_classes):
+        seg_arr_c = seg_arr[:, :] == c
+          # print(sum(sum(seg_arr_c)), colors[c] )
+        seg_img[:, :, 0] += ((seg_arr_c)*(colors[c][0])).astype('uint8')
+        seg_img[:, :, 1] += ((seg_arr_c)*(colors[c][1])).astype('uint8')
+        seg_img[:, :, 2] += ((seg_arr_c)*(colors[c][2])).astype('uint8')
+
+    return seg_img/255
+
+def get_legends(class_names, colors, tags):
+
+    n_classes = len(class_names)
+    legend = np.zeros(((len(class_names) * 25) + 25, 125, 3),
+                      dtype="uint8") + 255
+
+    class_names_colors = enumerate(zip(class_names[:n_classes],
+                                       colors[:n_classes]))
+    j = 0
+    for (i, (class_name, color)) in class_names_colors:
+        if i in tags:
+          color = [int(c) for c in color]
+          cv2.putText(legend, class_name, (5, (j * 25) + 17),
+                      cv2.FONT_HERSHEY_COMPLEX, 0.35, (0, 0, 0), 1)
+          cv2.rectangle(legend, (100, (j* 25)), (125, (j * 25) + 25),
+                        tuple(color), -1)
+          j +=1
+    return legend
+
+
+
+def preprocess_image(path_img):
+  img = Image.open(path_img)
+  ww = 512
+  hh = 512
+  img.thumbnail((hh, ww))
+  i = np.array(img)
+  ht, wd, cc= i.shape
+
+  # create new image of desired size and color (blue) for padding
+  color = (0,0,0)
+  result = np.full((hh,ww,cc), color, dtype=np.uint8)
+
+  # copy img image into center of result image
+  result[:ht, :wd] = img
+  return result, ht, wd
+
+def concat_lengends(seg_img, legend_img):
+
+  new_h = np.maximum(seg_img.shape[0], legend_img.shape[0])
+  new_w = seg_img.shape[1] + legend_img.shape[1]
+
+  out_img = np.zeros((new_h, new_w, 3)).astype('uint8') + legend_img[0, 0, 0]
+
+  out_img[:legend_img.shape[0], :  legend_img.shape[1]] = np.copy(legend_img)
+  out_img[:seg_img.shape[0], legend_img.shape[1]:] = np.copy(seg_img)
+
+  return out_img
+
+def main_convert(filename):
+
+  print(filename)
+  #load the image
+  img_path = filename
+  img = Image.open(img_path).convert("RGB")
+  tags = []
+
+  #preprocess the image
+  img_scaled_arr = preprocess_image(img_path)
+  image = np.expand_dims(img_scaled_arr[0], axis=0)
+
+  #make the predictions
+  pr_mask = model.predict(image).squeeze()
+  pr_mask_int = np.zeros((pr_mask.shape[0],pr_mask.shape[1]))
+
+  #filter the smallest noisy segments
+  kernel = np.ones((5, 5), 'uint8')
+
+  for i in range(1,19):
+    array_one = np.round(pr_mask[:,:,i])
+    op = cv2.morphologyEx(array_one, cv2.MORPH_OPEN, kernel)
+    if sum(sum(op ==1)) > 100:
+      tags.append(i)
+      pr_mask_int[op ==1] = i 
+
+  img_segmented = np.array(Image.fromarray(pr_mask_int[:img_scaled_arr[1], :img_scaled_arr[2]]).resize(img.size))
+
+  seg = get_colored_segmentation_image(img_segmented,19, colors=colors)
+
+  fused_img = ((np.array(img)/255)/2 + seg/2).astype('float32')
+
+  seg = Image.fromarray((seg*255).astype(np.uint8))
+  fused_img  = Image.fromarray((fused_img *255).astype(np.uint8))
+
+  #get the legends
+  legend_predicted = get_legends(c, colors, tags)
+
+  final_img = concat_lengends(np.array(fused_img), np.array(legend_predicted))
+
+  return final_img, seg
+  
 
 def list_llm_models() -> List[str]:    
     if len(llm_model_names) == 0:
@@ -261,6 +388,61 @@ with block:
             save_btn = gr.Button(value="💾Save")        
             save_input_elements = [google_api_key, huggingface_api_key, temperature, top_p, top_k, max_prompt_tokens,  max_output_tokens]
             save_btn.click(save_config,inputs=[*save_input_elements], outputs=[tabs, status, llm_model])
+        with gr.TabItem("Car Segmentation"):
+            with gr.Column():
+                gr.Markdown("""
+                    # Car Parts Segmentation
+                    This demo uses AI Models to detect 18 different parts of cars.
+                """)
+                
+                with gr.Row():
+                    # Left column for input
+                    with gr.Column(scale=1):
+                        input_image = gr.Image(
+                            type="filepath",
+                            label="Car Image",
+                            elem_id="input_image"
+                        )
+                        
+                        with gr.Row():
+                            clear_btn = gr.Button("Clear", size="sm")
+                            submit_btn = gr.Button("Submit", size="sm", variant="primary")
+
+                    # Right column for outputs
+                    with gr.Column(scale=1):
+                        detected_segments = gr.Image(
+                            type="pil",
+                            label="Detected Segments Image",
+                            elem_id="detected_segments"
+                        )
+                        
+                        segment_image = gr.Image(
+                            type="pil",
+                            label="Segment Image",
+                            elem_id="segment_image"
+                        )
+
+                # Examples section at the bottom
+                gr.Examples(
+                    examples=[["test_image.png"]],
+                    inputs=input_image,
+                    outputs=[detected_segments, segment_image],
+                    fn=main_convert,
+                    cache_examples=True
+                )
+
+                # Button functionality
+                clear_btn.click(
+                    fn=lambda: (None, None),
+                    inputs=None,
+                    outputs=[detected_segments, segment_image]
+                )
+
+                submit_btn.click(
+                    fn=main_convert,
+                    inputs=input_image,
+                    outputs=[detected_segments, segment_image]
+                )
         
     # Set configuration inputs
     TabConfig.select(load_config, outputs=[*save_input_elements])
